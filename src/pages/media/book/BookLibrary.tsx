@@ -868,7 +868,7 @@ const BookDetail = (props: { id: string; onBack: () => void }) => {
               item={data()}
               filePath={
                 currentEpisode()
-                  ? `${data().folder_path}/${currentEpisode()!.file_name}`
+                  ? `${data().file_path}/${currentEpisode()!.file_name}`
                   : undefined
               }
               title={
