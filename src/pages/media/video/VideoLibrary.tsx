@@ -16,18 +16,33 @@ import { getMediaName, parseAuthors, parseEpisodes } from "~/types"
 import { api, base_path, ext } from "~/utils"
 import Artplayer from "artplayer"
 import artplayerProxyMediabunny from "~/components/artplayer-proxy-mediabunny"
+import { attachMediabunnyAudio } from "~/components/artplayer-proxy-mediabunny/AudioPatch"
+import { prefetchVideoChunks } from "~/components/artplayer-proxy-mediabunny/Prefetcher"
 import Hls from "hls.js"
 import mpegts from "mpegts.js"
 import { registerAc3Decoder } from "@mediabunny/ac3"
 
-// MediaBunny 播放器开关：从 localStorage 读取用户偏好
+// MediaBunny 播放器模式：三档选择
+//   "disabled"   - 禁用（使用原生 <video>，默认）
+//   "audio_only" - 仅解码音频（原生 <video> 解码画面 + mediabunny 单独提供音轨）
+//   "full"       - 全部解码（mediabunny 接管，音频 + 视频均由 mediabunny）
 const MEDIABUNNY_KEY = "use_mediabunny_player"
+type MediaBunnyMode = "disabled" | "audio_only" | "full"
+function getMediaBunnyMode(): MediaBunnyMode {
+  const v = localStorage.getItem(MEDIABUNNY_KEY)
+  if (v === "audio_only") return "audio_only"
+  // 向下兼容旧版 "true/false" 布尔值
+  if (v === "true" || v === "full") return "full"
+  return "disabled"
+}
+function setMediaBunnyMode(mode: MediaBunnyMode) {
+  localStorage.setItem(MEDIABUNNY_KEY, mode)
+}
 function isMediaBunnyEnabled(): boolean {
-  return localStorage.getItem(MEDIABUNNY_KEY) === "true"
+  return getMediaBunnyMode() !== "disabled"
 }
-function setMediaBunnyEnabled(enabled: boolean) {
-  localStorage.setItem(MEDIABUNNY_KEY, enabled ? "true" : "false")
-}
+const mediabunnyModeLabel = (m: MediaBunnyMode) =>
+  m === "disabled" ? "禁用" : m === "audio_only" ? "仅音频" : "全部解码"
 // 仅在启用 MediaBunny 时注册 AC3 解码器
 if (isMediaBunnyEnabled()) {
   registerAc3Decoder()
@@ -175,6 +190,15 @@ const VideoPlayer = (props: {
   onMount(() => {
     if (!playerContainer) return
     const fileExt = ext(props.item.file_name)
+
+    // 在创建播放器之前，先预下载视频文件的前几个区块。
+    // 不 await：后台异步进行，Artplayer 初始化过程与预取同时进行，由浏览器 HTTP
+    // 缓存负责后续请求命中。mediabunny / 原生 <video> 请求同一 URL 后会命中缓存。
+    void prefetchVideoChunks(videoUrl(), {
+      byteRange: 8 * 1024 * 1024,
+      timeoutMs: 3000,
+    })
+
     player = new Artplayer({
       container: playerContainer,
       url: videoUrl(),
@@ -195,8 +219,10 @@ const VideoPlayer = (props: {
       mutex: true,
       playsInline: true,
       type: fileExt,
-      setting: true,
-      ...(isMediaBunnyEnabled() ? { proxy: artplayerProxyMediabunny() } : {}),
+      // 仅在 "full" 模式下使用 proxy 接管。audio_only 下 video 仍是原生解码，mediabunny 只提供音轨（onMount 后装障）
+      ...(getMediaBunnyMode() === "full"
+        ? { proxy: artplayerProxyMediabunny() }
+        : {}),
       customType: {
         m3u8: (video: HTMLMediaElement, src: string) => {
           hlsPlayer = new Hls()
@@ -219,23 +245,36 @@ const VideoPlayer = (props: {
         {
           id: "setting_mediabunny",
           html: "MediaBunny 播放器",
-          tooltip: isMediaBunnyEnabled() ? "已启用" : "已禁用",
+          tooltip: mediabunnyModeLabel(getMediaBunnyMode()),
           icon: '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
-          switch: isMediaBunnyEnabled(),
-          onSwitch: function (item: any) {
-            const newVal = !item.switch
-            setMediaBunnyEnabled(newVal)
-            item.tooltip = newVal ? "已启用" : "已禁用"
+          selector: (
+            ["disabled", "audio_only", "full"] as MediaBunnyMode[]
+          ).map((m) => ({
+            html: mediabunnyModeLabel(m),
+            name: m,
+            default: getMediaBunnyMode() === m,
+          })),
+          onSelect: function (item: any) {
+            const newMode = item.name as MediaBunnyMode
+            setMediaBunnyMode(newMode)
             setTimeout(() => {
-              if (confirm("切换播放器需要刷新页面才能生效，是否立即刷新？")) {
+              if (
+                confirm("切换播放器模式需要刷新页面才能生效，是否立即刷新？")
+              ) {
                 location.reload()
               }
             }, 100)
-            return newVal
+            return mediabunnyModeLabel(newMode)
           },
         },
       ],
     })
+
+    // “仅音频”模式：原生 <video> 负责视频解码，mediabunny 只提供音轨。
+    // 这里手动 attach，避免原生音轨（可能不支持的编码如 AC3）与 mediabunny 同时出声。
+    if (getMediaBunnyMode() === "audio_only") {
+      attachMediabunnyAudio(player, videoUrl())
+    }
   })
 
   onCleanup(() => {

@@ -4,11 +4,32 @@
  */
 import AudioEngine from "./AudioEngine.js"
 import VideoEngine from "./VideoEngine.js"
+import { prefetchVideoChunks } from "./Prefetcher.js"
+import {
+  registerHardwareDecoder,
+  setHardwareDecoderDebug,
+} from "./HardwareDecoder.js"
 
 export default class MediaBunnyEngine {
   constructor({ canvas, ctx, events, option = {} }) {
     this.events = events
     this.option = option
+
+    // 启动硬件加速解码器（默认开启）—— 为 mediabunny 注册一个加载了 prefer-hardware 的自定义解码器
+    if (option.hardwareAcceleration !== false) {
+      registerHardwareDecoder()
+    }
+
+    // 调试日志开关：option.debug=true 或 localStorage 写过 "mediabunny_debug=1" 都会启用
+    const debugFromStorage =
+      typeof localStorage !== "undefined" &&
+      localStorage.getItem("mediabunny_debug") === "1"
+    if (option.debug || debugFromStorage) {
+      setHardwareDecoderDebug(true)
+      console.log(
+        "[MediaBunny] 调试日志已启用。在控制台运行 window.__HARDWARE_DECODER_STATS__ 查看硬解命中统计。",
+      )
+    }
 
     // Create audio and video engines
     this.audio = new AudioEngine(events)
@@ -18,9 +39,14 @@ export default class MediaBunnyEngine {
       events,
       timeupdateInterval: option.timeupdateInterval ?? 250,
       avSyncTolerance: option.avSyncTolerance ?? 0.12,
-      dropLateFrames: option.dropLateFrames ?? false,
+      // 默认开启跳帧（dropLateFrames），用户明确允许
+      dropLateFrames: option.dropLateFrames ?? true,
       poster: option.poster ?? "",
       preflightRange: option.preflightRange ?? false,
+      disableVideo: option.disableVideo === true,
+      resyncThreshold: option.resyncThreshold ?? 1.5,
+      // 帧预读队列大小。兼容老参数名 poolSize。
+      lookaheadFrames: option.lookaheadFrames ?? option.poolSize ?? 3,
     })
 
     // Playback state
@@ -50,6 +76,26 @@ export default class MediaBunnyEngine {
 
     setTimeout(() => this.events.emit("waiting"), 0)
     setTimeout(() => this.events.emit("loadstart"), 0)
+
+    // 预下载几个区块：在真正初始化 mediabunny 之前先用 HTTP Range 请求拿到首部数据，
+    // 这样 mediabunny 后续请求会命中浏览器 HTTP 缓存、避免开播阶段连续 RTT。
+    // 只对字符串 URL 预取；Blob/ReadableStream 本地源跳过。
+    if (
+      typeof src === "string" &&
+      this.option.prefetchEnabled !== false &&
+      id === this.loadSeq
+    ) {
+      try {
+        await prefetchVideoChunks(src, {
+          byteRange: this.option.prefetchBytes ?? 8 * 1024 * 1024,
+          timeoutMs: this.option.prefetchTimeoutMs ?? 3000,
+        })
+      } catch (_) {
+        /* prefetch 失败不阻止主流程 */
+      }
+      // 预取期间可能已被新的 load() 覆盖，丢弃本轮
+      if (id !== this.loadSeq) return
+    }
 
     const loadTimeout = Number.isFinite(this.option.loadTimeout)
       ? this.option.loadTimeout

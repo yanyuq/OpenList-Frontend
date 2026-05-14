@@ -9,15 +9,28 @@ import { type Option } from "artplayer/types/option"
 import { type Setting } from "artplayer/types/setting"
 import { type Events } from "artplayer/types/events"
 import artplayerProxyMediabunny from "~/components/artplayer-proxy-mediabunny"
+import { attachMediabunnyAudio } from "~/components/artplayer-proxy-mediabunny/AudioPatch"
+import { prefetchVideoChunks } from "~/components/artplayer-proxy-mediabunny/Prefetcher"
 import artplayerPluginDanmuku from "artplayer-plugin-danmuku"
 
-// MediaBunny 播放器开关：从 localStorage 读取用户偏好
+// MediaBunny 播放器模式：三档选择
+//   "disabled"   - 禁用（使用原生 <video>，默认）
+//   "audio_only" - 仅解码音频（避免问题视频轨道崩溃，canvas 仅显示 poster）
+//   "full"       - 全部解码（音频 + 视频）
 const MEDIABUNNY_KEY = "use_mediabunny_player"
-function isMediaBunnyEnabled(): boolean {
-  return localStorage.getItem(MEDIABUNNY_KEY) === "true"
+type MediaBunnyMode = "disabled" | "audio_only" | "full"
+function getMediaBunnyMode(): MediaBunnyMode {
+  const v = localStorage.getItem(MEDIABUNNY_KEY)
+  if (v === "audio_only") return "audio_only"
+  // 向下兼容旧版"true/false"布尔值
+  if (v === "true" || v === "full") return "full"
+  return "disabled"
 }
-function setMediaBunnyEnabled(enabled: boolean) {
-  localStorage.setItem(MEDIABUNNY_KEY, enabled ? "true" : "false")
+function setMediaBunnyMode(mode: MediaBunnyMode) {
+  localStorage.setItem(MEDIABUNNY_KEY, mode)
+}
+function isMediaBunnyEnabled(): boolean {
+  return getMediaBunnyMode() !== "disabled"
 }
 import { type Option as DanmukuOption } from "artplayer-plugin-danmuku"
 import artplayerPluginAss from "~/components/artplayer-plugin-ass"
@@ -116,7 +129,9 @@ const Preview = () => {
     quality: [],
     // highlight: [],
     plugins: [AutoHeightPlugin],
-    ...(isMediaBunnyEnabled() ? { proxy: artplayerProxyMediabunny() } : {}),
+    ...(getMediaBunnyMode() === "full"
+      ? { proxy: artplayerProxyMediabunny() }
+      : {}),
     whitelist: [],
     settings: [],
     // subtitle:{}
@@ -308,29 +323,46 @@ const Preview = () => {
       }),
     )
   }
-  // 添加 MediaBunny 播放器开关到设置菜单
+  // 添加 MediaBunny 播放器三档模式选择到设置菜单
+  const mediabunnyModeLabel = (m: MediaBunnyMode) =>
+    m === "disabled" ? "禁用" : m === "audio_only" ? "仅音频" : "全部解码"
   option.settings?.push({
     id: "setting_mediabunny",
     html: "MediaBunny 播放器",
-    tooltip: isMediaBunnyEnabled() ? "已启用" : "已禁用",
+    tooltip: mediabunnyModeLabel(getMediaBunnyMode()),
     icon: '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
-    switch: isMediaBunnyEnabled(),
-    onSwitch: function (item: Setting) {
-      const newVal = !item.switch
-      setMediaBunnyEnabled(newVal)
-      item.tooltip = newVal ? "已启用" : "已禁用"
-      // 提示用户需要刷新页面
+    selector: (["disabled", "audio_only", "full"] as MediaBunnyMode[]).map(
+      (m) => ({
+        html: mediabunnyModeLabel(m),
+        name: m,
+        default: getMediaBunnyMode() === m,
+      }),
+    ),
+    onSelect: function (item: Setting) {
+      const newMode = item.name as MediaBunnyMode
+      setMediaBunnyMode(newMode)
       setTimeout(() => {
-        if (confirm("切换播放器需要刷新页面才能生效，是否立即刷新？")) {
+        if (confirm("切换播放器模式需要刷新页面才能生效，是否立即刷新？")) {
           location.reload()
         }
       }, 100)
-      return newVal
+      return mediabunnyModeLabel(newMode)
     },
   })
 
   onMount(() => {
+    // 预下载视频文件的前几个区块（不阻塞，与 Artplayer 初始化同时进行）
+    if (objStore.raw_url) {
+      void prefetchVideoChunks(objStore.raw_url, {
+        byteRange: 8 * 1024 * 1024,
+        timeoutMs: 3000,
+      })
+    }
     player = new Artplayer(option)
+    // “仅音频”模式：原生 <video> 解码视频，mediabunny 只提供音轨
+    if (getMediaBunnyMode() === "audio_only" && objStore.raw_url) {
+      attachMediabunnyAudio(player, objStore.raw_url)
+    }
     let auto_fullscreen: boolean
     switch (searchParams["auto_fullscreen"]) {
       case "true":
