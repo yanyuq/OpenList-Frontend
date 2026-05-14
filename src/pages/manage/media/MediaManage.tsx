@@ -1641,6 +1641,22 @@ export const MediaManagePage = (props: MediaManagePageProps) => {
           </div>
         </div>
       </Show>
+
+      {/* 签名提醒 */}
+      <div
+        style={{
+          "margin-top": "24px",
+          padding: "10px 14px",
+          background: "#fffbeb",
+          border: "1px solid #fcd34d",
+          "border-radius": "8px",
+          "font-size": "13px",
+          color: "#78350f",
+        }}
+      >
+        ⚠️ 提示：请关闭「全局设置」 → 「签名所有」和「存储驱动」 →
+        「启用签名」，并且不要对扫描路径及其父路径设置「元信息」→「密码」，否则将无法正常播放媒体内容。
+      </div>
     </div>
   )
 }
