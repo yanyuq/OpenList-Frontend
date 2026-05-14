@@ -38,15 +38,14 @@ const MediaSettings = () => {
   const [imageThumbnailMode, setImageThumbnailMode] = createSignal<
     "base64" | "local"
   >("base64")
-  const [imageThumbnailPath, setImageThumbnailPath] =
-    createSignal("/.thumbnail")
+  const [imageThumbnailPath, setImageThumbnailPath] = createSignal("/imgs")
   const [imageStoreThumbnail, setImageStoreThumbnail] = createSignal(false)
 
   // 图书配置
   const [bookThumbnailMode, setBookThumbnailMode] = createSignal<
     "base64" | "local"
   >("base64")
-  const [bookThumbnailPath, setBookThumbnailPath] = createSignal("/.thumbnail")
+  const [bookThumbnailPath, setBookThumbnailPath] = createSignal("/imgs")
 
   const [saving, setSaving] = createSignal(false)
   const [saveMsg, setSaveMsg] = createSignal("")
@@ -72,7 +71,7 @@ const MediaSettings = () => {
         setImageThumbnailMode(
           (sc.thumbnail_mode as "base64" | "local") || "base64",
         )
-        setImageThumbnailPath(sc.thumbnail_path || "/.thumbnail")
+        setImageThumbnailPath(sc.thumbnail_path || "/imgs")
       } catch {}
     }
     if (bookConfig) {
@@ -81,7 +80,7 @@ const MediaSettings = () => {
         setBookThumbnailMode(
           (sc.thumbnail_mode as "base64" | "local") || "base64",
         )
-        setBookThumbnailPath(sc.thumbnail_path || "/.thumbnail")
+        setBookThumbnailPath(sc.thumbnail_path || "/imgs")
       } catch {}
     }
   })
@@ -383,7 +382,7 @@ const MediaSettings = () => {
                         onInput={(e) =>
                           setImageThumbnailPath(e.currentTarget.value)
                         }
-                        placeholder="/.thumbnail"
+                        placeholder="/imgs"
                         style={{
                           background: inputBg(),
                           border: `1px solid ${inputBorder()}`,
@@ -414,7 +413,7 @@ const MediaSettings = () => {
                             "border-radius": "3px",
                           }}
                         >
-                          /.thumbnail
+                          /imgs
                         </code>
                       </p>
                     </div>
@@ -514,7 +513,7 @@ const MediaSettings = () => {
                     type="text"
                     value={bookThumbnailPath()}
                     onInput={(e) => setBookThumbnailPath(e.currentTarget.value)}
-                    placeholder="/.thumbnail"
+                    placeholder="/imgs"
                     style={{
                       background: inputBg(),
                       border: `1px solid ${inputBorder()}`,
@@ -545,7 +544,7 @@ const MediaSettings = () => {
                         "border-radius": "3px",
                       }}
                     >
-                      /.thumbnail
+                      /imgs
                     </code>
                   </p>
                 </div>
@@ -634,7 +633,7 @@ const MediaSettings = () => {
               </li>
               <li>
                 本地存储路径支持 VFS 路径（如{" "}
-                <code style={{ "font-family": "monospace" }}>/.thumbnail</code>
+                <code style={{ "font-family": "monospace" }}>/imgs</code>
                 ），需确保对应存储有写入权限
               </li>
             </ul>

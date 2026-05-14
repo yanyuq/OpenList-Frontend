@@ -15,6 +15,8 @@ import {
   adminStartMediaScan,
   adminStartMediaScrape,
   adminClearMediaDB,
+  adminExportMediaDB,
+  adminImportMediaDB,
   adminGetMediaScanProgress,
   adminListMediaScanPaths,
   adminCreateMediaScanPath,
@@ -497,6 +499,134 @@ export const MediaManagePage = (props: MediaManagePageProps) => {
     })
   }
 
+  // ============== 导入 / 导出 ==============
+
+  // 触发浏览器下载 Blob
+  const triggerDownload = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement("a")
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  }
+
+  // 校验导出返回是否为合法的 JSON Blob（出错时后端返回 JSON 错误体）
+  // 若不是 JSON 文件则提示用户
+  const handleBlobExport = async (blob: Blob, filename: string) => {
+    if (!blob || !(blob instanceof Blob)) {
+      showToast("导出失败：未收到文件流", "error")
+      return
+    }
+    // 如果误返回了错误 JSON（很短）则尝试解析
+    if (blob.size < 1024) {
+      try {
+        const txt = await blob.text()
+        const obj = JSON.parse(txt)
+        if (obj && typeof obj.code === "number" && obj.code !== 200) {
+          showToast("导出失败: " + (obj.message || "未知错误"), "error")
+          return
+        }
+      } catch {
+        // 不是 JSON 错误体，按文件下载继续
+      }
+    }
+    triggerDownload(blob, filename)
+    showToast("导出成功")
+  }
+
+  // 导出当前媒体类型的全部数据
+  const handleExportAll = async () => {
+    try {
+      const blob = await adminExportMediaDB(props.mediaType)
+      const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)
+      handleBlobExport(blob, `media_export_${props.mediaType}_${ts}.json`)
+    } catch (e: any) {
+      showToast("导出失败: " + (e?.message || e), "error")
+    }
+  }
+
+  // 导出单个扫描路径
+  const handleExportScanPath = async (sp: MediaScanPath) => {
+    try {
+      const blob = await adminExportMediaDB(undefined, sp.id!)
+      const safeName = (sp.name || sp.path || `path_${sp.id}`).replace(
+        /[\\/:*?"<>|]/g,
+        "_",
+      )
+      const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)
+      handleBlobExport(
+        blob,
+        `media_export_${props.mediaType}_${safeName}_${ts}.json`,
+      )
+    } catch (e: any) {
+      showToast("导出失败: " + (e?.message || e), "error")
+    }
+  }
+
+  // 通用：用 input[type=file] 选择文件后回调
+  const pickJsonFile = (): Promise<File | null> => {
+    return new Promise((resolve) => {
+      const input = document.createElement("input")
+      input.type = "file"
+      input.accept = "application/json,.json"
+      input.onchange = () => {
+        const f = input.files && input.files[0] ? input.files[0] : null
+        resolve(f)
+      }
+      input.click()
+    })
+  }
+
+  // 导入到当前媒体库（按导出文件中原扫描路径关系还原）
+  const handleImportAll = async () => {
+    const file = await pickJsonFile()
+    if (!file) return
+    showConfirm({
+      title: `导入 ${props.title} 数据`,
+      message: `即将导入文件「${file.name}」，已存在的条目会按唯一键被覆盖更新。是否继续？`,
+      confirmText: "导入",
+      type: "warning",
+      onConfirm: async () => {
+        const resp = await adminImportMediaDB(file)
+        if (resp.code === 200) {
+          const d = resp.data
+          showToast(
+            `导入完成：路径 +${d.scan_paths_created}/~${d.scan_paths_updated}，条目 +${d.items_created}/~${d.items_updated}`,
+          )
+          await loadScanPaths()
+          refetchItems()
+        } else {
+          showToast("导入失败: " + resp.message, "error")
+        }
+      },
+    })
+  }
+
+  // 导入到指定扫描路径（覆盖文件中条目的 scan_path_id）
+  const handleImportScanPath = async (sp: MediaScanPath) => {
+    const file = await pickJsonFile()
+    if (!file) return
+    showConfirm({
+      title: `导入到「${sp.name || sp.path}」`,
+      message: `即将把文件「${file.name}」中的条目全部归入此扫描路径，是否继续？`,
+      confirmText: "导入",
+      type: "warning",
+      onConfirm: async () => {
+        const resp = await adminImportMediaDB(file, sp.id!)
+        if (resp.code === 200) {
+          const d = resp.data
+          showToast(`导入完成：条目 +${d.items_created}/~${d.items_updated}`)
+          refetchItems()
+        } else {
+          showToast("导入失败: " + resp.message, "error")
+        }
+      },
+    })
+  }
+
   // 保存编辑
   const handleSaveItem = async () => {
     if (!editingItem()) return
@@ -669,6 +799,12 @@ export const MediaManagePage = (props: MediaManagePageProps) => {
               style={btnStyle("#f59e0b")}
             >
               {scraping() ? "刮削中..." : "✨ 立即刮削"}
+            </button>
+            <button onClick={handleExportAll} style={btnStyle("#0ea5e9")}>
+              ⬇️ 导出全部
+            </button>
+            <button onClick={handleImportAll} style={btnStyle("#8b5cf6")}>
+              ⬆️ 导入数据
             </button>
             <button onClick={handleClearAll} style={btnStyle("#ef4444")}>
               🗑️ 清空全部
@@ -879,6 +1015,18 @@ export const MediaManagePage = (props: MediaManagePageProps) => {
                             style={actionBtnStyle("#f0fdf4", "#10b981")}
                           >
                             编辑
+                          </button>
+                          <button
+                            onClick={() => handleExportScanPath(sp)}
+                            style={actionBtnStyle("#ecfeff", "#0ea5e9")}
+                          >
+                            导出
+                          </button>
+                          <button
+                            onClick={() => handleImportScanPath(sp)}
+                            style={actionBtnStyle("#f5f3ff", "#8b5cf6")}
+                          >
+                            导入
                           </button>
                           <button
                             onClick={() => handleClearScanPathDB(sp)}

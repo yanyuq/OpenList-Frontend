@@ -141,3 +141,44 @@ export const adminClearMediaDB = (mediaType: MediaType) =>
   r.post("/admin/media/clear", null, {
     params: { media_type: mediaType },
   }) as Promise<Resp<null>>
+
+/** 导出媒体数据
+ *  - mediaType 为空 + scanPathId 为空 => 全部导出
+ *  - 仅 mediaType => 导出指定类型
+ *  - 仅 scanPathId => 导出单个扫描路径
+ *  返回 Blob，供前端触发浏览器下载
+ */
+export const adminExportMediaDB = (
+  mediaType?: MediaType,
+  scanPathId?: number,
+) => {
+  const params: Record<string, any> = {}
+  if (mediaType) params.media_type = mediaType
+  if (scanPathId) params.scan_path_id = scanPathId
+  return r.get("/admin/media/export", {
+    params,
+    responseType: "blob",
+  }) as unknown as Promise<Blob>
+}
+
+/** 导入媒体数据（multipart/form-data）
+ *  scanPathId 可选：传入则把导入条目的 scan_path_id 全部覆盖为该值
+ *  （用于"导入到指定扫描路径"场景）
+ */
+export const adminImportMediaDB = (file: File, scanPathId?: number) => {
+  const form = new FormData()
+  form.append("file", file)
+  const params: Record<string, any> = {}
+  if (scanPathId) params.scan_path_id = scanPathId
+  return r.post("/admin/media/import", form, {
+    params,
+    headers: { "Content-Type": "multipart/form-data" },
+  }) as Promise<
+    Resp<{
+      scan_paths_created: number
+      scan_paths_updated: number
+      items_created: number
+      items_updated: number
+    }>
+  >
+}
