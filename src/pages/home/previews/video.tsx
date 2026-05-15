@@ -1,26 +1,37 @@
 import { Box } from "@hope-ui/solid"
-import {
-  createEffect,
-  createMemo,
-  createSignal,
-  on,
-  onCleanup,
-  onMount,
-} from "solid-js"
+import { createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import { useRouter, useLink } from "~/hooks"
-import {
-  getMainColor,
-  getSettingBool,
-  objStore,
-  setShouldKeepState,
-} from "~/store"
-import { Obj, ObjType } from "~/types"
+import { getMainColor, getSettingBool, objStore } from "~/store"
+import { ObjType } from "~/types"
 import { ext, pathDir, pathJoin } from "~/utils"
 import Artplayer from "artplayer"
-import { type Option } from "artplayer"
-import { type Setting } from "artplayer"
-import { type Events } from "artplayer"
+import { type Option } from "artplayer/types/option"
+import { type Setting } from "artplayer/types/setting"
+import { type Events } from "artplayer/types/events"
+import artplayerProxyMediabunny from "~/components/artplayer-proxy-mediabunny"
+import { attachMediabunnyAudio } from "~/components/artplayer-proxy-mediabunny/AudioPatch"
+import { prefetchVideoChunks } from "~/components/artplayer-proxy-mediabunny/Prefetcher"
 import artplayerPluginDanmuku from "artplayer-plugin-danmuku"
+
+// MediaBunny 播放器模式：三档选择
+//   "disabled"   - 禁用（使用原生 <video>，默认）
+//   "audio_only" - 仅解码音频（避免问题视频轨道崩溃，canvas 仅显示 poster）
+//   "full"       - 全部解码（音频 + 视频）
+const MEDIABUNNY_KEY = "use_mediabunny_player"
+type MediaBunnyMode = "disabled" | "audio_only" | "full"
+function getMediaBunnyMode(): MediaBunnyMode {
+  const v = localStorage.getItem(MEDIABUNNY_KEY)
+  if (v === "audio_only") return "audio_only"
+  // 向下兼容旧版"true/false"布尔值
+  if (v === "true" || v === "full") return "full"
+  return "disabled"
+}
+function setMediaBunnyMode(mode: MediaBunnyMode) {
+  localStorage.setItem(MEDIABUNNY_KEY, mode)
+}
+function isMediaBunnyEnabled(): boolean {
+  return getMediaBunnyMode() !== "disabled"
+}
 import { type Option as DanmukuOption } from "artplayer-plugin-danmuku"
 import artplayerPluginAss from "~/components/artplayer-plugin-ass"
 import mpegts from "mpegts.js"
@@ -30,6 +41,12 @@ import { AutoHeightPlugin, VideoBox } from "./video_box"
 import { ArtPlayerIconsSubtitle } from "~/components/icons"
 import { useNavigate } from "@solidjs/router"
 import "./artplayer.css"
+import { registerAc3Decoder } from "@mediabunny/ac3"
+import { requestTranscodePlay } from "~/utils/media_api"
+// 仅在启用 MediaBunny 时注册 AC3 解码器
+if (isMediaBunnyEnabled()) {
+  registerAc3Decoder()
+}
 
 const Preview = () => {
   const { pathname, searchParams } = useRouter()
@@ -62,7 +79,10 @@ const Preview = () => {
   let flvPlayer: mpegts.Player
   let hlsPlayer: Hls
   let option: Option = {
+    id: pathname(),
     container: "#video-player",
+    url: objStore.raw_url,
+    title: objStore.obj.name,
     volume: 1.0,
     autoplay: getSettingBool("video_autoplay"),
     autoSize: false,
@@ -110,6 +130,9 @@ const Preview = () => {
     quality: [],
     // highlight: [],
     plugins: [AutoHeightPlugin],
+    ...(getMediaBunnyMode() === "full"
+      ? { proxy: artplayerProxyMediabunny() }
+      : {}),
     whitelist: [],
     settings: [],
     // subtitle:{}
@@ -119,9 +142,9 @@ const Preview = () => {
       playsInline: true,
       crossOrigin: "anonymous",
     },
+    type: ext(objStore.obj.name),
     customType: {
       flv: function (video: HTMLMediaElement, url: string) {
-        flvPlayer?.destroy()
         flvPlayer = mpegts.createPlayer(
           {
             type: "flv",
@@ -133,7 +156,6 @@ const Preview = () => {
         flvPlayer.load()
       },
       m3u8: function (video: HTMLMediaElement, url: string) {
-        hlsPlayer?.destroy()
         hlsPlayer = new Hls()
         hlsPlayer.loadSource(url)
         hlsPlayer.attachMedia(video)
@@ -151,37 +173,123 @@ const Preview = () => {
     autoOrientation: true,
     airplay: true,
   }
-  const subtitleAndDanmu = createMemo(() => {
-    const subtitle: Obj[] = []
-    let danmu: Obj | undefined
-    for (const obj of objStore.related) {
-      const name = obj.name.toLowerCase()
-      if (
-        name.endsWith(".srt") ||
-        name.endsWith(".ass") ||
-        name.endsWith(".vtt")
-      ) {
-        subtitle.push(obj)
-      } else if (!danmu && name.endsWith(".xml")) {
-        danmu = obj
+  const subtitle = objStore.related.filter((obj) => {
+    for (const ext of [".srt", ".ass", ".vtt"]) {
+      if (obj.name.endsWith(ext)) {
+        return true
       }
     }
-    return { subtitle, danmu }
+    return false
+  })
+  const danmu = objStore.related.find((obj) => {
+    for (const ext of [".xml"]) {
+      if (obj.name.endsWith(ext)) {
+        return true
+      }
+    }
+    return false
   })
 
   // TODO: add a switch in manage panel to choose whether to enable `libass-wasm`
   const enableEnhanceAss = true
 
-  const switchUrl = (url: string) => {
-    const { playing } = player
-    player.pause()
-    player.option.id = pathname()
-    player.option.type = ext(objStore.obj.name)
-    player.switchUrl(url).finally(() => playing && player.play())
-
-    const { subtitle, danmu } = subtitleAndDanmu()
+  if (subtitle.length != 0) {
     let isEnhanceAssMode = false
-    const setSubtitleVisible = (visible: boolean) => {
+
+    // set default subtitle
+    const defaultSubtitle = subtitle[0]
+    if (enableEnhanceAss && ext(defaultSubtitle.name).toLowerCase() === "ass") {
+      isEnhanceAssMode = true
+      option.plugins?.push(
+        artplayerPluginAss({
+          // debug: true,
+          subUrl: proxyLink(defaultSubtitle, true),
+        }),
+      )
+    } else {
+      option.subtitle = {
+        url: proxyLink(defaultSubtitle, true),
+        type: ext(defaultSubtitle.name),
+        escape: false,
+      }
+    }
+
+    // render subtitle toggle menu
+    const innerMenu: Setting[] = [
+      {
+        id: "setting_subtitle_display",
+        html: "Display",
+        tooltip: "Show",
+        switch: true,
+        onSwitch: function (item: Setting) {
+          item.tooltip = item.switch ? "Hide" : "Show"
+          setSubtitleVisible(!item.switch)
+
+          // sync menu subtitle tooltip
+          const menu_sub = option.settings?.find(
+            (_) => _.id === "setting_subtitle",
+          )
+          menu_sub && (menu_sub.tooltip = item.tooltip)
+
+          return !item.switch
+        },
+      },
+    ]
+    subtitle.forEach((item, i) => {
+      innerMenu.push({
+        default: i === 0,
+        html: (
+          <span
+            title={item.name}
+            style={{
+              "max-width": "200px",
+              overflow: "hidden",
+              "text-overflow": "ellipsis",
+              "word-break": "break-all",
+              "white-space": "normal",
+              display: "-webkit-box",
+              "-webkit-line-clamp": "2",
+              "-webkit-box-orient": "vertical",
+              "font-size": "12px",
+            }}
+          >
+            {item.name}
+          </span>
+        ) as HTMLElement,
+        name: item.name,
+        url: proxyLink(item, true),
+      })
+    })
+
+    option.settings?.push({
+      id: "setting_subtitle",
+      html: "Subtitle",
+      tooltip: "Show",
+      icon: ArtPlayerIconsSubtitle({ size: 24 }) as HTMLElement,
+      selector: innerMenu,
+      onSelect: function (item: Setting) {
+        if (enableEnhanceAss && ext(item.name).toLowerCase() === "ass") {
+          isEnhanceAssMode = true
+          this.emit("artplayer-plugin-ass:switch" as keyof Events, item.url)
+          setSubtitleVisible(true)
+        } else {
+          isEnhanceAssMode = false
+          this.subtitle.switch(item.url, { name: item.name })
+          this.once("subtitleLoad", setSubtitleVisible.bind(this, true))
+        }
+
+        const switcher = innerMenu.find(
+          (_) => _.id === "setting_subtitle_display",
+        )
+
+        if (switcher && !switcher.switch) switcher.$html?.click?.()
+
+        // sync from display switcher
+        return switcher?.tooltip
+      },
+    })
+
+    function setSubtitleVisible(visible: boolean) {
       const type = isEnhanceAssMode ? "ass" : "webvtt"
 
       switch (type) {
@@ -197,113 +305,104 @@ const Preview = () => {
           break
       }
     }
-    if (subtitle.length) {
-      // render subtitle toggle menu
-      const innerMenu: Setting[] = [
-        {
-          name: "setting_subtitle_display",
-          html: "Display",
-          tooltip: "Show",
-          switch: true,
-          onSwitch: function (item: Setting) {
-            item.tooltip = item.switch ? "Hide" : "Show"
-            setSubtitleVisible(!item.switch)
+  }
 
-            // sync menu subtitle tooltip
-            const menu_sub = this.setting.find("setting_subtitle")
-            menu_sub && (menu_sub.tooltip = item.tooltip)
-
-            return !item.switch
-          },
-        },
-      ]
-      subtitle.forEach((item, i) => {
-        innerMenu.push({
-          default: i === 0,
-          html: (
-            <span
-              title={item.name}
-              style={{
-                "max-width": "200px",
-                overflow: "hidden",
-                "text-overflow": "ellipsis",
-                "word-break": "break-all",
-                "white-space": "normal",
-                display: "-webkit-box",
-                "-webkit-line-clamp": "2",
-                "-webkit-box-orient": "vertical",
-                "font-size": "12px",
-              }}
-            >
-              {item.name}
-            </span>
-          ) as HTMLElement,
-          name: item.name,
-          url: proxyLink(item, true),
-        })
-      })
-
-      const onSelect = function (this: Artplayer, item: Setting) {
-        if (enableEnhanceAss && ext(item.name).toLowerCase() === "ass") {
-          isEnhanceAssMode = true
-          if (!player.plugins.artplayerPluginAss) {
-            player.plugins.add(artplayerPluginAss({ subUrl: item.url }))
-          } else {
-            this.emit("artplayer-plugin-ass:switch" as keyof Events, item.url)
-          }
-          setSubtitleVisible(true)
-        } else {
-          isEnhanceAssMode = false
-          this.subtitle.switch(item.url, { name: item.name })
-          this.once("subtitleLoad", setSubtitleVisible.bind(this, true))
+  if (danmu) {
+    option.plugins?.push(
+      artplayerPluginDanmuku({
+        speed: 5,
+        opacity: 1,
+        fontSize: 25,
+        mode: 0,
+        antiOverlap: false,
+        synchronousPlayback: false,
+        theme: "dark",
+        heatmap: true,
+        ...JSON.parse(localStorage.getItem("danmuku_config") || "{}"),
+        emitter: false,
+        danmuku: proxyLink(danmu, true),
+      }),
+    )
+  }
+  // 添加 MediaBunny 播放器三档模式选择到设置菜单
+  const mediabunnyModeLabel = (m: MediaBunnyMode) =>
+    m === "disabled" ? "禁用" : m === "audio_only" ? "仅音频" : "全部解码"
+  option.settings?.push({
+    id: "setting_mediabunny",
+    html: "MediaBunny 播放器",
+    tooltip: mediabunnyModeLabel(getMediaBunnyMode()),
+    icon: '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
+    selector: (["disabled", "audio_only", "full"] as MediaBunnyMode[]).map(
+      (m) => ({
+        html: mediabunnyModeLabel(m),
+        name: m,
+        default: getMediaBunnyMode() === m,
+      }),
+    ),
+    onSelect: function (item: Setting) {
+      const newMode = item.name as MediaBunnyMode
+      setMediaBunnyMode(newMode)
+      setTimeout(() => {
+        if (confirm("切换播放器模式需要刷新页面才能生效，是否立即刷新？")) {
+          location.reload()
         }
+      }, 100)
+      return mediabunnyModeLabel(newMode)
+    },
+  })
 
-        const switcher = innerMenu.find(
-          (_) => _.name === "setting_subtitle_display",
+  onMount(async () => {
+    // ---- 云端转码判断 ----
+    // 播放前先调用后端转码决策接口，如果需要转码则使用 HLS master_url 播放
+    let useTranscode = false
+    try {
+      const tcResp = await requestTranscodePlay(pathname())
+      if (
+        tcResp.code === 200 &&
+        tcResp.data?.transcode &&
+        tcResp.data.master_url
+      ) {
+        useTranscode = true
+        option.url = tcResp.data.master_url
+        option.type = "m3u8"
+        console.log(
+          `[transcode] 使用云端转码播放: job=${tcResp.data.job_id}, profile=${tcResp.data.profile}`,
         )
-
-        if (switcher && !switcher.switch) switcher.$html?.click?.()
-
-        // sync from display switcher
-        return switcher?.tooltip
       }
-      player.setting.update({
-        name: "setting_subtitle",
-        html: "Subtitle",
-        tooltip: "Show",
-        icon: ArtPlayerIconsSubtitle({ size: 24 }) as HTMLElement,
-        selector: innerMenu,
-        onSelect,
-      })
-      onSelect.call(player, innerMenu[1])
-    } else {
-      player.setting.find("setting_subtitle") &&
-        player.setting.remove("setting_subtitle")
-      setSubtitleVisible(false)
+    } catch (e) {
+      // 转码接口失败（可能未开启），静默降级到直链播放
+      console.debug("[transcode] 转码接口不可用，使用直链播放", e)
     }
-    const danmukuPlugin = player.plugins.artplayerPluginDanmuku as ReturnType<
-      ReturnType<typeof artplayerPluginDanmuku>
-    >
-    if (danmukuPlugin) {
-      danmukuPlugin.reset()
-      danmukuPlugin.option.danmuku = []
-      danmukuPlugin.load(danmu ? proxyLink(danmu, true) : undefined)
-    } else if (danmu) {
-      player.plugins.add(
-        artplayerPluginDanmuku({
-          speed: 5,
-          opacity: 1,
-          fontSize: 25,
-          mode: 0,
-          antiOverlap: false,
-          synchronousPlayback: false,
-          theme: "dark",
-          heatmap: true,
-          ...JSON.parse(localStorage.getItem("danmuku_config") || "{}"),
-          emitter: false,
-          danmuku: proxyLink(danmu, true),
-        }),
-      )
+
+    // 预下载视频文件的前几个区块（仅直链模式，转码模式由 HLS.js 管理）
+    if (!useTranscode && objStore.raw_url) {
+      void prefetchVideoChunks(objStore.raw_url, {
+        byteRange: 8 * 1024 * 1024,
+        timeoutMs: 3000,
+      })
+    }
+    player = new Artplayer(option)
+    // "仅音频"模式：原生 <video> 解码视频，mediabunny 只提供音轨（仅直链模式）
+    if (
+      !useTranscode &&
+      getMediaBunnyMode() === "audio_only" &&
+      objStore.raw_url
+    ) {
+      attachMediabunnyAudio(player, objStore.raw_url)
+    }
+    let auto_fullscreen: boolean
+    switch (searchParams["auto_fullscreen"]) {
+      case "true":
+        auto_fullscreen = true
+      case "false":
+        auto_fullscreen = false
+      default:
+        auto_fullscreen = false
+    }
+    player.on("ready", () => {
+      player.fullscreen = auto_fullscreen
+    })
+    if (danmu) {
       player.on("artplayerPluginDanmuku:config", (option) => {
         const {
           speed,
@@ -334,27 +433,6 @@ const Preview = () => {
         )
       })
     }
-  }
-
-  onMount(() => {
-    player = new Artplayer(option)
-    createEffect(on(() => objStore.raw_url, switchUrl))
-    let auto_fullscreen: boolean
-    switch (searchParams["auto_fullscreen"]) {
-      case "true":
-        auto_fullscreen = true
-      case "false":
-        auto_fullscreen = false
-      default:
-        auto_fullscreen = false
-    }
-    player.on("ready", () => {
-      player.fullscreen = auto_fullscreen
-    })
-    const onFullscreen = () =>
-      setShouldKeepState(player.fullscreen || player.fullscreenWeb)
-    player.on("fullscreen", onFullscreen)
-    player.on("fullscreenWeb", onFullscreen)
     player.on("video:ended", () => {
       if (!autoNext()) return
       next_video()
@@ -369,13 +447,8 @@ const Preview = () => {
     })
   })
   onCleanup(() => {
-    setShouldKeepState(false)
-    if (player) {
-      player.fullscreenWeb = false
-      player.fullscreen = false
-      player.pip && (player.pip = false)
-      player.destroy()
-    }
+    if (player && player.video) player.video.src = ""
+    player?.destroy()
     flvPlayer?.destroy()
     hlsPlayer?.destroy()
   })

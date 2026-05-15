@@ -1,0 +1,999 @@
+import {
+  createSignal,
+  createResource,
+  createMemo,
+  Show,
+  For,
+  onMount,
+  onCleanup,
+} from "solid-js"
+import { useColorMode } from "@hope-ui/solid"
+import { MediaLayout } from "../MediaLayout"
+import { MediaBrowser } from "../MediaBrowser"
+import { getMediaItem, requestTranscodePlay } from "~/utils/media_api"
+import type { MediaItem, EpisodeInfo } from "~/types"
+import { getMediaName, parseAuthors, parseEpisodes } from "~/types"
+import { api, base_path, ext } from "~/utils"
+import Artplayer from "artplayer"
+import artplayerProxyMediabunny from "~/components/artplayer-proxy-mediabunny"
+import { attachMediabunnyAudio } from "~/components/artplayer-proxy-mediabunny/AudioPatch"
+import { prefetchVideoChunks } from "~/components/artplayer-proxy-mediabunny/Prefetcher"
+import Hls from "hls.js"
+import mpegts from "mpegts.js"
+import { registerAc3Decoder } from "@mediabunny/ac3"
+
+// MediaBunny 播放器模式：三档选择
+//   "disabled"   - 禁用（使用原生 <video>，默认）
+//   "audio_only" - 仅解码音频（原生 <video> 解码画面 + mediabunny 单独提供音轨）
+//   "full"       - 全部解码（mediabunny 接管，音频 + 视频均由 mediabunny）
+const MEDIABUNNY_KEY = "use_mediabunny_player"
+type MediaBunnyMode = "disabled" | "audio_only" | "full"
+function getMediaBunnyMode(): MediaBunnyMode {
+  const v = localStorage.getItem(MEDIABUNNY_KEY)
+  if (v === "audio_only") return "audio_only"
+  // 向下兼容旧版 "true/false" 布尔值
+  if (v === "true" || v === "full") return "full"
+  return "disabled"
+}
+function setMediaBunnyMode(mode: MediaBunnyMode) {
+  localStorage.setItem(MEDIABUNNY_KEY, mode)
+}
+function isMediaBunnyEnabled(): boolean {
+  return getMediaBunnyMode() !== "disabled"
+}
+const mediabunnyModeLabel = (m: MediaBunnyMode) =>
+  m === "disabled" ? "禁用" : m === "audio_only" ? "仅音频" : "全部解码"
+// 仅在启用 MediaBunny 时注册 AC3 解码器
+if (isMediaBunnyEnabled()) {
+  registerAc3Decoder()
+}
+
+// ==================== 视频卡片 ====================
+const VideoCard = (props: { item: MediaItem }) => {
+  const { colorMode } = useColorMode()
+  const isDark = createMemo(() => colorMode() === "dark")
+  const cardBg = createMemo(() =>
+    isDark() ? "rgba(255,255,255,0.04)" : "rgba(0,0,0,0.03)",
+  )
+  const cardBorder = createMemo(() =>
+    isDark() ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.08)",
+  )
+  const coverBg = createMemo(() => (isDark() ? "#1e293b" : "#e2e8f0"))
+  const titleColor = createMemo(() => (isDark() ? "#e2e8f0" : "#1e293b"))
+  const subColor = createMemo(() => (isDark() ? "#64748b" : "#94a3b8"))
+  const name = () => getMediaName(props.item)
+  return (
+    <div
+      style={{
+        background: cardBg(),
+        "border-radius": "12px",
+        overflow: "hidden",
+        border: `1px solid ${cardBorder()}`,
+        transition: "transform 0.2s, box-shadow 0.2s",
+      }}
+      onMouseEnter={(e) => {
+        e.currentTarget.style.transform = "translateY(-4px)"
+        e.currentTarget.style.boxShadow = isDark()
+          ? "0 12px 32px rgba(0,0,0,0.4)"
+          : "0 12px 32px rgba(0,0,0,0.15)"
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.transform = "translateY(0)"
+        e.currentTarget.style.boxShadow = "none"
+      }}
+    >
+      {/* 封面 */}
+      <div
+        style={{
+          position: "relative",
+          "padding-top": "150%",
+          background: coverBg(),
+        }}
+      >
+        <Show
+          when={props.item.cover}
+          fallback={
+            <div
+              style={{
+                position: "absolute",
+                inset: "0",
+                display: "flex",
+                "align-items": "center",
+                "justify-content": "center",
+                "font-size": "48px",
+                color: subColor(),
+              }}
+            >
+              🎬
+            </div>
+          }
+        >
+          <img
+            src={props.item.cover}
+            alt={name()}
+            style={{
+              position: "absolute",
+              inset: "0",
+              width: "100%",
+              height: "100%",
+              "object-fit": "cover",
+            }}
+            loading="lazy"
+          />
+        </Show>
+        {/* 评分角标 */}
+        <Show when={props.item.rating > 0}>
+          <div
+            style={{
+              position: "absolute",
+              top: "8px",
+              right: "8px",
+              background: "rgba(0,0,0,0.7)",
+              "border-radius": "6px",
+              padding: "2px 6px",
+              "font-size": "11px",
+              color: "#fbbf24",
+              "font-weight": "600",
+            }}
+          >
+            ⭐ {props.item.rating.toFixed(1)}
+          </div>
+        </Show>
+      </div>
+      {/* 信息 */}
+      <div style={{ padding: "10px 12px" }}>
+        <div
+          style={{
+            color: titleColor(),
+            "font-size": "13px",
+            "font-weight": "500",
+            overflow: "hidden",
+            "text-overflow": "ellipsis",
+            "white-space": "nowrap",
+            "margin-bottom": "4px",
+          }}
+          title={name()}
+        >
+          {name()}
+        </div>
+        <Show when={props.item.release_date}>
+          <div style={{ color: subColor(), "font-size": "11px" }}>
+            {props.item.release_date?.slice(0, 4)}
+          </div>
+        </Show>
+      </div>
+    </div>
+  )
+}
+
+// ==================== 内嵌视频播放器 ====================
+const VideoPlayer = (props: {
+  item: MediaItem
+  // 可选：指定播放的文件路径和标题（用于选集播放）
+  filePath?: string
+  title?: string
+  onClose: () => void
+}) => {
+  let playerContainer: HTMLDivElement | undefined
+  let player: Artplayer | undefined
+  let hlsPlayer: Hls | undefined
+  let flvPlayer: mpegts.Player | undefined
+
+  // 优先使用传入的 filePath，否则拼接 folder_path + "/" + file_name
+  const videoUrl = () => {
+    if (props.filePath) return `${api}/p${props.filePath}?force`
+    const folder = props.item.folder_path?.replace(/\/$/, "") ?? ""
+    return `${api}/p${folder}/${props.item.file_name}?force`
+  }
+  const videoTitle = () => props.title ?? getMediaName(props.item)
+
+  onMount(async () => {
+    if (!playerContainer) return
+    let fileExt = ext(props.item.file_name)
+
+    // ---- 云端转码判断 ----
+    // 播放前先调用后端转码决策接口，如果需要转码则使用 HLS master_url 播放
+    let useTranscode = false
+    let actualUrl = videoUrl()
+    try {
+      const filePath =
+        props.filePath ??
+        `${props.item.folder_path?.replace(/\/$/, "") ?? ""}/${props.item.file_name}`
+      const tcResp = await requestTranscodePlay(filePath)
+      if (
+        tcResp.code === 200 &&
+        tcResp.data?.transcode &&
+        tcResp.data.master_url
+      ) {
+        useTranscode = true
+        actualUrl = tcResp.data.master_url
+        fileExt = "m3u8"
+        console.log(
+          `[transcode] 媒体库使用云端转码播放: job=${tcResp.data.job_id}, profile=${tcResp.data.profile}`,
+        )
+      }
+    } catch (e) {
+      // 转码接口失败（可能未开启），静默降级到直链播放
+      console.debug("[transcode] 转码接口不可用，使用直链播放", e)
+    }
+
+    // 预下载视频文件的前几个区块（仅直链模式，转码模式由 HLS.js 管理）
+    if (!useTranscode) {
+      void prefetchVideoChunks(videoUrl(), {
+        byteRange: 8 * 1024 * 1024,
+        timeoutMs: 3000,
+      })
+    }
+
+    player = new Artplayer({
+      container: playerContainer,
+      url: actualUrl,
+      title: videoTitle(),
+      volume: 1.0,
+      autoplay: false,
+      autoSize: false,
+      loop: false,
+      flip: true,
+      playbackRate: true,
+      aspectRatio: true,
+      screenshot: true,
+      setting: true,
+      hotkey: true,
+      pip: true,
+      fullscreen: true,
+      fullscreenWeb: true,
+      mutex: true,
+      playsInline: true,
+      type: fileExt,
+      // 【重要】转码模式下一律使用 HLS.js，不使用 mediabunny proxy，
+      // 避免 proxy 与 HLS.js 同时接管 video 元素导致双重加载、重复请求。
+      // 只有直链播放且 mediabunny=full 时才启用 proxy。
+      ...(!useTranscode && getMediaBunnyMode() === "full"
+        ? { proxy: artplayerProxyMediabunny() }
+        : {}),
+      customType: {
+        m3u8: (video: HTMLMediaElement, src: string, art: Artplayer) => {
+          // 【重复创建保护】customType 可能被 Artplayer 多次触发（如 url 刷新、
+          // proxy + customType 冲突），创建多个 Hls 实例会导致同一个 video
+          // 元素上多个 HLS.js 并发拉取 playlist 和切片，产生请求风暴。
+          if (hlsPlayer) {
+            console.warn(
+              "[hls] customType triggered again, destroying previous instance",
+            )
+            hlsPlayer.destroy()
+            hlsPlayer = undefined
+          }
+          hlsPlayer = new Hls({
+            // 缓冲策略：适当增大缓冲区，减少频繁请求切片
+            maxBufferLength: 30, // 最大前向缓冲 30 秒（小于最小 playlist 长度，避免超前请求）
+            maxMaxBufferLength: 60, // 极端情况下最大 60 秒
+            maxBufferSize: 60 * 1024 * 1024, // 缓冲区最大 60MB
+            maxBufferHole: 0.5, // 允许的缓冲空洞 0.5 秒
+            // EVENT 类型 playlist 刷新策略：
+            // 转码进行中 playlist 为 EVENT 类型，需要定期刷新以获取新切片
+            // 但不能太频繁，否则浪费带宽
+            levelLoadingMaxRetry: 4,
+            levelLoadingRetryDelay: 1000,
+            // 【关键】关闭 progressive 和 worker，避免主线程+worker 同时请求切片
+            // progressive=true 在 EVENT playlist 下会导致重复请求同一切片填冲缓冲区
+            progressive: false,
+            enableWorker: false,
+            // 降低 fragment 加载重试频率
+            fragLoadingMaxRetry: 4,
+            fragLoadingRetryDelay: 1000,
+            // 关键：设置 backBufferLength 保留已播放的缓冲区，
+            // 避免 seek 回退时重新请求已下载的切片
+            backBufferLength: 60,
+            // 【关键】EVENT 类型 playlist 的动态刷新间隔，
+            // 默认根据 TARGETDURATION 调整，这里明确设置避免过频轮询
+            liveSyncDuration: 6,
+            liveMaxLatencyDuration: 30,
+          })
+
+          // ---- 防止 play() 与 HLS.js load 竞态 ----
+          // HLS.js attachMedia 会异步接管 video 媒体源，在 manifest 解析完成前
+          // 任何 play() 调用都会被浏览器中断并抛出 AbortError。
+          // 解决方案：拦截 video.play()，在 manifest 就绪前将请求排队，就绪后自动执行。
+          let hlsReady = false
+          let pendingPlay = false
+          const origPlay = video.play.bind(video)
+          video.play = function () {
+            if (hlsReady) {
+              return origPlay()
+            }
+            // manifest 尚未就绪，记录待播放状态，稍后自动触发
+            pendingPlay = true
+            console.debug("[hls] play() deferred, waiting for manifest")
+            return Promise.resolve()
+          } as typeof video.play
+
+          hlsPlayer.loadSource(src)
+          hlsPlayer.attachMedia(video)
+
+          // ---- 【最终兜底】单切片请求次数限流 ----
+          // 无论什么原因（codec 不匹配、recoverMediaError 死循环、buffer append 失败等），
+          // 如果同一个切片 URL 被请求超过 5 次，说明已经陷入无法恢复的死循环，
+          // 直接销毁 hls 实例，避免后端被请求洪水冲垮。
+          const fragRequestCount = new Map<string, number>()
+          const MAX_PER_FRAG = 5
+          hlsPlayer.on(Hls.Events.FRAG_LOADING, (_: any, data: any) => {
+            const url = data?.frag?.url || data?.frag?.relurl || ""
+            if (!url) return
+            const cnt = (fragRequestCount.get(url) || 0) + 1
+            fragRequestCount.set(url, cnt)
+            if (cnt > MAX_PER_FRAG) {
+              console.error(
+                `[hls] fragment requested ${cnt} times, aborting to prevent flood: ${url}`,
+              )
+              if (hlsPlayer) {
+                hlsPlayer.destroy()
+                hlsPlayer = undefined
+              }
+              hlsReady = true
+              video.play = origPlay
+              // 提示用户
+              try {
+                art.notice.show = "播放失败：转码切片格式异常，请检查后端日志"
+              } catch {
+                // ignore
+              }
+            }
+          })
+
+          hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => {
+            console.debug("[hls] manifest parsed, ready to play")
+            hlsReady = true
+            // 恢复原始 play 方法
+            video.play = origPlay
+            // 如果在等待期间有 play 请求，现在执行
+            if (pendingPlay) {
+              pendingPlay = false
+              origPlay().catch((e: any) => {
+                // 忽略用户手势限制等非致命错误
+                if (e.name !== "AbortError") {
+                  console.warn("[hls] deferred play failed:", e)
+                }
+              })
+            }
+          })
+
+          // ---- HLS.js 错误恢复（带限流，防止坏切片导致死循环）----
+          let recoverCount = 0
+          let lastRecoverAt = 0
+          let swapAudioCodecTried = false
+          hlsPlayer.on(Hls.Events.ERROR, (_: any, data: any) => {
+            if (!data.fatal) return
+            console.error("[hls] fatal error:", data.type, data.details)
+            if (data.type === Hls.ErrorTypes.MEDIA_ERROR && hlsPlayer) {
+              const now = Date.now()
+              // 距离上次恢复 <3s 视为同一坏切片，累计计数；否则重置
+              if (now - lastRecoverAt < 3000) {
+                recoverCount++
+              } else {
+                recoverCount = 1
+              }
+              lastRecoverAt = now
+              if (recoverCount === 1) {
+                console.warn("[hls] recoverMediaError() #1")
+                hlsPlayer.recoverMediaError()
+              } else if (recoverCount === 2 && !swapAudioCodecTried) {
+                console.warn("[hls] recoverMediaError() #2 + swapAudioCodec()")
+                swapAudioCodecTried = true
+                hlsPlayer.swapAudioCodec()
+                hlsPlayer.recoverMediaError()
+              } else {
+                // 超过 2 次连续 media error → 放弃，避免后端切片被无限请求
+                console.error(
+                  "[hls] media error unrecoverable, giving up to prevent request flood",
+                )
+                hlsPlayer.destroy()
+                hlsPlayer = null
+                hlsReady = true
+                video.play = origPlay
+              }
+            } else {
+              hlsReady = true
+              video.play = origPlay // 恢复，避免永久拦截
+            }
+          })
+          // 注意：不要手动设置 video.src，HLS.js attachMedia 已接管媒体源
+          // 手动赋值会导致 video 重新加载，与 Artplayer 的 play() 产生竞态
+        },
+        flv: (video: HTMLMediaElement, src: string) => {
+          flvPlayer = mpegts.createPlayer({ type: "flv", url: src })
+          flvPlayer.attachMediaElement(video)
+          flvPlayer.load()
+        },
+      },
+      moreVideoAttr: {
+        // @ts-ignore
+        "webkit-playsinline": true,
+        playsInline: true,
+      },
+      settings: [
+        {
+          id: "setting_mediabunny",
+          html: "MediaBunny 播放器",
+          tooltip: mediabunnyModeLabel(getMediaBunnyMode()),
+          icon: '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
+          selector: (
+            ["disabled", "audio_only", "full"] as MediaBunnyMode[]
+          ).map((m) => ({
+            html: mediabunnyModeLabel(m),
+            name: m,
+            default: getMediaBunnyMode() === m,
+          })),
+          onSelect: function (item: any) {
+            const newMode = item.name as MediaBunnyMode
+            setMediaBunnyMode(newMode)
+            setTimeout(() => {
+              if (
+                confirm("切换播放器模式需要刷新页面才能生效，是否立即刷新？")
+              ) {
+                location.reload()
+              }
+            }, 100)
+            return mediabunnyModeLabel(newMode)
+          },
+        },
+      ],
+    })
+
+    // "仅音频"模式：原生 <video> 负责视频解码，mediabunny 只提供音轨。
+    // 仅在直链模式下生效，转码模式已经是 HLS 流，不需要 mediabunny 音频补丁。
+    if (!useTranscode && getMediaBunnyMode() === "audio_only") {
+      attachMediabunnyAudio(player, videoUrl())
+    }
+  })
+
+  onCleanup(() => {
+    // 先销毁 HLS/FLV 播放器，再销毁 Artplayer
+    // 避免 Artplayer destroy 时触发 video.src 变更导致多余的 load 事件
+    if (hlsPlayer) {
+      hlsPlayer.destroy()
+      hlsPlayer = undefined
+    }
+    if (flvPlayer) {
+      flvPlayer.destroy()
+      flvPlayer = undefined
+    }
+    if (player) {
+      player.destroy()
+      player = undefined
+    }
+  })
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: "0",
+        "z-index": "200",
+        background: "#000",
+        display: "flex",
+        "flex-direction": "column",
+      }}
+    >
+      {/* 顶部栏 */}
+      <div
+        style={{
+          display: "flex",
+          "align-items": "center",
+          gap: "12px",
+          padding: "10px 16px",
+          background: "rgba(0,0,0,0.8)",
+          "flex-shrink": "0",
+        }}
+      >
+        <button
+          onClick={props.onClose}
+          style={{
+            background: "rgba(255,255,255,0.08)",
+            border: "1px solid rgba(255,255,255,0.12)",
+            "border-radius": "8px",
+            color: "#94a3b8",
+            padding: "6px 14px",
+            cursor: "pointer",
+            "font-size": "13px",
+          }}
+        >
+          ← 返回
+        </button>
+        <span
+          style={{
+            color: "#e2e8f0",
+            "font-size": "14px",
+            "font-weight": "500",
+          }}
+        >
+          {videoTitle()}
+        </span>
+      </div>
+
+      {/* 播放区域 */}
+      <div style={{ flex: "1", position: "relative", background: "#000" }}>
+        <div ref={playerContainer} style={{ width: "100%", height: "100%" }} />
+      </div>
+    </div>
+  )
+}
+
+// ==================== 视频详情页 ====================
+const VideoDetail = (props: { id: string; onBack: () => void }) => {
+  const { colorMode } = useColorMode()
+  const isDark = createMemo(() => colorMode() === "dark")
+  const [item] = createResource(
+    () => parseInt(props.id),
+    async (id) => {
+      const resp = await getMediaItem(id)
+      if (resp.code === 200) return resp.data
+      return null
+    },
+  )
+
+  const [showPlayer, setShowPlayer] = createSignal(false)
+  // 当前播放的选集（null 表示播放主文件）
+  const [currentEpisode, setCurrentEpisode] = createSignal<EpisodeInfo | null>(
+    null,
+  )
+
+  const backBtnBg = createMemo(() =>
+    isDark() ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.05)",
+  )
+  const backBtnBorder = createMemo(() =>
+    isDark() ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.12)",
+  )
+  const backBtnColor = createMemo(() => (isDark() ? "#94a3b8" : "#64748b"))
+  const titleColor = createMemo(() => (isDark() ? "#f1f5f9" : "#0f172a"))
+  const metaColor = createMemo(() => (isDark() ? "#64748b" : "#94a3b8"))
+  const genreBg = createMemo(() =>
+    isDark() ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.05)",
+  )
+  const genreColor = createMemo(() => (isDark() ? "#94a3b8" : "#64748b"))
+  const authorColor = createMemo(() => (isDark() ? "#94a3b8" : "#475569"))
+  const authorLabelColor = createMemo(() => (isDark() ? "#64748b" : "#94a3b8"))
+  const plotTitleColor = createMemo(() => (isDark() ? "#94a3b8" : "#64748b"))
+  const plotColor = createMemo(() => (isDark() ? "#cbd5e1" : "#334155"))
+  const coverFallbackBg = createMemo(() => (isDark() ? "#1e293b" : "#e2e8f0"))
+  const coverFallbackColor = createMemo(() =>
+    isDark() ? "#334155" : "#94a3b8",
+  )
+
+  return (
+    <Show
+      when={item()}
+      fallback={
+        <div
+          style={{
+            "text-align": "center",
+            padding: "60px",
+            color: metaColor(),
+          }}
+        >
+          {item.loading ? "加载中..." : "资源不存在"}
+        </div>
+      }
+    >
+      {(data) => {
+        const authors = () => parseAuthors(data().authors)
+        const genres = () => data().genre?.split(",").filter(Boolean) ?? []
+
+        return (
+          <div>
+            {/* 返回按鈕 */}
+            <button
+              onClick={props.onBack}
+              style={{
+                background: backBtnBg(),
+                border: `1px solid ${backBtnBorder()}`,
+                "border-radius": "8px",
+                color: backBtnColor(),
+                padding: "8px 16px",
+                cursor: "pointer",
+                "font-size": "13px",
+                "margin-bottom": "24px",
+                display: "flex",
+                "align-items": "center",
+                gap: "6px",
+              }}
+            >
+              ← 返回
+            </button>
+
+            {/* 背景模糊层 */}
+            <Show when={data().cover}>
+              <div
+                style={{
+                  position: "fixed",
+                  inset: "0",
+                  "background-image": `url(${data().cover})`,
+                  "background-size": "cover",
+                  "background-position": "center",
+                  filter: "blur(40px) brightness(0.2)",
+                  "z-index": "-1",
+                  transform: "scale(1.1)",
+                }}
+              />
+            </Show>
+
+            {/* 详情内容 */}
+            <div
+              style={{
+                display: "flex",
+                gap: "32px",
+                "flex-wrap": "wrap",
+              }}
+            >
+              {/* 封面 */}
+              <div style={{ "flex-shrink": "0" }}>
+                <Show
+                  when={data().cover}
+                  fallback={
+                    <div
+                      style={{
+                        width: "220px",
+                        height: "330px",
+                        background: coverFallbackBg(),
+                        "border-radius": "12px",
+                        display: "flex",
+                        "align-items": "center",
+                        "justify-content": "center",
+                        "font-size": "64px",
+                        color: coverFallbackColor(),
+                      }}
+                    >
+                      🎬
+                    </div>
+                  }
+                >
+                  <img
+                    src={data().cover}
+                    alt={getMediaName(data())}
+                    style={{
+                      width: "220px",
+                      height: "330px",
+                      "object-fit": "cover",
+                      "border-radius": "12px",
+                      "box-shadow": "0 20px 60px rgba(0,0,0,0.5)",
+                    }}
+                  />
+                </Show>
+              </div>
+
+              {/* 信息 */}
+              <div style={{ flex: "1", "min-width": "280px" }}>
+                <h1
+                  style={{
+                    margin: "0 0 8px",
+                    "font-size": "28px",
+                    "font-weight": "700",
+                    color: titleColor(),
+                    "line-height": "1.2",
+                  }}
+                >
+                  {getMediaName(data())}
+                </h1>
+
+                {/* 元信息行 */}
+                <div
+                  style={{
+                    display: "flex",
+                    "align-items": "center",
+                    gap: "12px",
+                    "flex-wrap": "wrap",
+                    "margin-bottom": "16px",
+                  }}
+                >
+                  <Show when={data().rating > 0}>
+                    <span
+                      style={{
+                        background: "rgba(251,191,36,0.15)",
+                        border: "1px solid rgba(251,191,36,0.3)",
+                        "border-radius": "6px",
+                        padding: "3px 8px",
+                        color: "#fbbf24",
+                        "font-size": "14px",
+                        "font-weight": "600",
+                      }}
+                    >
+                      ⭐ {data().rating.toFixed(1)}
+                    </span>
+                  </Show>
+                  <Show when={data().release_date}>
+                    <span style={{ color: metaColor(), "font-size": "14px" }}>
+                      {data().release_date?.slice(0, 4)}
+                    </span>
+                  </Show>
+                  <Show when={data().video_type}>
+                    <span
+                      style={{
+                        background: "rgba(99,102,241,0.15)",
+                        border: "1px solid rgba(99,102,241,0.3)",
+                        "border-radius": "6px",
+                        padding: "3px 8px",
+                        color: "#a5b4fc",
+                        "font-size": "12px",
+                      }}
+                    >
+                      {data().video_type === "movie" ? "电影" : "电视剧"}
+                    </span>
+                  </Show>
+                </div>
+
+                {/* 类型标签 */}
+                <Show when={genres().length > 0}>
+                  <div
+                    style={{
+                      display: "flex",
+                      "flex-wrap": "wrap",
+                      gap: "6px",
+                      "margin-bottom": "16px",
+                    }}
+                  >
+                    <For each={genres()}>
+                      {(g) => (
+                        <span
+                          style={{
+                            background: genreBg(),
+                            "border-radius": "6px",
+                            padding: "3px 10px",
+                            color: genreColor(),
+                            "font-size": "12px",
+                          }}
+                        >
+                          {g}
+                        </span>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+
+                {/* 演员 */}
+                <Show when={authors().length > 0}>
+                  <div style={{ "margin-bottom": "16px" }}>
+                    <span
+                      style={{ color: authorLabelColor(), "font-size": "13px" }}
+                    >
+                      主演：
+                    </span>
+                    <span style={{ color: authorColor(), "font-size": "13px" }}>
+                      {authors().slice(0, 5).join(" / ")}
+                    </span>
+                  </div>
+                </Show>
+
+                {/* 播放器（全屏覆盖层） */}
+                <Show when={showPlayer()}>
+                  <VideoPlayer
+                    item={data()}
+                    filePath={
+                      currentEpisode()
+                        ? `${data().folder_path?.replace(/\/$/, "")}/${data().file_name}/${currentEpisode()!.file_name}`
+                        : undefined
+                    }
+                    title={
+                      currentEpisode()
+                        ? currentEpisode()!.index > 0
+                          ? `第${currentEpisode()!.index}集 ${currentEpisode()!.title}`
+                          : currentEpisode()!.title
+                        : undefined
+                    }
+                    onClose={() => setShowPlayer(false)}
+                  />
+                </Show>
+
+                {/* 无选集：直接显示播放按钮 */}
+                <Show when={parseEpisodes(data().episodes).length === 0}>
+                  <button
+                    onClick={() => {
+                      setCurrentEpisode(null)
+                      setShowPlayer(true)
+                    }}
+                    style={{
+                      background: "linear-gradient(135deg, #6366f1, #8b5cf6)",
+                      border: "none",
+                      "border-radius": "10px",
+                      color: "white",
+                      padding: "12px 28px",
+                      "font-size": "15px",
+                      "font-weight": "600",
+                      cursor: "pointer",
+                      display: "flex",
+                      "align-items": "center",
+                      gap: "8px",
+                      "box-shadow": "0 4px 16px rgba(99,102,241,0.4)",
+                      "margin-bottom": "24px",
+                    }}
+                  >
+                    ▶ 立即播放
+                  </button>
+                </Show>
+
+                {/* 选集列表（路径合并模式下有选集时显示） */}
+                <Show when={parseEpisodes(data().episodes).length > 0}>
+                  {(_) => {
+                    const episodes = parseEpisodes(data().episodes)
+                    return (
+                      <div style={{ "margin-bottom": "24px" }}>
+                        <h3
+                          style={{
+                            color: plotTitleColor(),
+                            "font-size": "13px",
+                            "font-weight": "600",
+                            "text-transform": "uppercase",
+                            "letter-spacing": "0.08em",
+                            "margin-bottom": "12px",
+                          }}
+                        >
+                          选集（共 {episodes.length} 集）
+                        </h3>
+                        <div
+                          style={{
+                            display: "grid",
+                            "grid-template-columns":
+                              "repeat(auto-fill, minmax(120px, 1fr))",
+                            gap: "8px",
+                            "max-height": "260px",
+                            "overflow-y": "auto",
+                            "padding-right": "4px",
+                          }}
+                        >
+                          <For each={episodes}>
+                            {(ep) => {
+                              const isActive = () =>
+                                currentEpisode()?.file_name === ep.file_name
+                              const label =
+                                ep.index > 0
+                                  ? `第${ep.index}集${ep.title ? " " + ep.title : ""}`
+                                  : ep.title || ep.file_name
+                              return (
+                                <button
+                                  onClick={() => {
+                                    setCurrentEpisode(ep)
+                                    setShowPlayer(true)
+                                  }}
+                                  title={ep.file_name}
+                                  style={{
+                                    background: isActive()
+                                      ? "linear-gradient(135deg, #6366f1, #8b5cf6)"
+                                      : isDark()
+                                        ? "rgba(255,255,255,0.06)"
+                                        : "rgba(0,0,0,0.05)",
+                                    border: isActive()
+                                      ? "none"
+                                      : `1px solid ${isDark() ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.1)"}`,
+                                    "border-radius": "8px",
+                                    color: isActive()
+                                      ? "white"
+                                      : isDark()
+                                        ? "#94a3b8"
+                                        : "#475569",
+                                    padding: "8px 10px",
+                                    "font-size": "12px",
+                                    cursor: "pointer",
+                                    "text-align": "left",
+                                    overflow: "hidden",
+                                    "text-overflow": "ellipsis",
+                                    "white-space": "nowrap",
+                                    transition: "all 0.15s",
+                                    "box-shadow": isActive()
+                                      ? "0 2px 8px rgba(99,102,241,0.4)"
+                                      : "none",
+                                  }}
+                                >
+                                  ▶ {label}
+                                </button>
+                              )
+                            }}
+                          </For>
+                        </div>
+                      </div>
+                    )
+                  }}
+                </Show>
+
+                {/* 剧情简介 */}
+                <Show when={data().plot || data().description}>
+                  <div>
+                    <h3
+                      style={{
+                        color: plotTitleColor(),
+                        "font-size": "13px",
+                        "font-weight": "600",
+                        "text-transform": "uppercase",
+                        "letter-spacing": "0.08em",
+                        "margin-bottom": "8px",
+                      }}
+                    >
+                      剧情简介
+                    </h3>
+                    <p
+                      style={{
+                        color: plotColor(),
+                        "font-size": "14px",
+                        "line-height": "1.7",
+                        margin: "0",
+                      }}
+                    >
+                      {data().plot || data().description}
+                    </p>
+                  </div>
+                </Show>
+              </div>
+            </div>
+          </div>
+        )
+      }}
+    </Show>
+  )
+}
+
+// ==================== 视频库主页 ====================
+const VideoLibrary = () => {
+  const [selectedId, setSelectedId] = createSignal<string | null>(null)
+
+  return (
+    <MediaLayout title="🎬 影视资源库">
+      <Show
+        when={selectedId()}
+        fallback={
+          <MediaBrowser
+            mediaType="video"
+            onItemClick={(item) => setSelectedId(String(item.id))}
+            renderCard={(item) => <VideoCard item={item} />}
+            renderListRow={(item) => {
+              const { colorMode: cm } = useColorMode()
+              const dark = createMemo(() => cm() === "dark")
+              return (
+                <>
+                  <Show
+                    when={item.cover}
+                    fallback={<span style={{ "font-size": "20px" }}>🎬</span>}
+                  >
+                    <img
+                      src={item.cover}
+                      style={{
+                        width: "32px",
+                        height: "48px",
+                        "object-fit": "cover",
+                        "border-radius": "4px",
+                      }}
+                    />
+                  </Show>
+                  <div style={{ flex: "1" }}>
+                    <div
+                      style={{
+                        color: dark() ? "#e2e8f0" : "#1e293b",
+                        "font-size": "14px",
+                      }}
+                    >
+                      {getMediaName(item)}
+                    </div>
+                    <div
+                      style={{
+                        color: dark() ? "#475569" : "#94a3b8",
+                        "font-size": "12px",
+                      }}
+                    >
+                      {item.release_date?.slice(0, 4)}{" "}
+                      {item.genre?.split(",")[0]}
+                    </div>
+                  </div>
+                  <Show when={item.rating > 0}>
+                    <span style={{ color: "#fbbf24", "font-size": "13px" }}>
+                      ⭐ {item.rating.toFixed(1)}
+                    </span>
+                  </Show>
+                </>
+              )
+            }}
+          />
+        }
+      >
+        <VideoDetail id={selectedId()!} onBack={() => setSelectedId(null)} />
+      </Show>
+    </MediaLayout>
+  )
+}
+
+export default VideoLibrary
