@@ -140,8 +140,11 @@
     "username": "Username"
   },
   "189CloudPC": {
+    "access_token": "Access token",
     "family_id": "Family id",
     "family_transfer": "Family transfer",
+    "generate_torrent": "Generate torrent",
+    "generate_torrent-tips": "Generate torrent file with CAS extension after upload",
     "login_type": "Login type",
     "login_types": {
       "password": "Password",
@@ -592,6 +595,19 @@
     "refresh_token": "Refresh token",
     "root_folder_path": "Root folder path",
     "use_online_api": "Use online api"
+  },
+  "Emby": {
+    "api_key": "Api key",
+    "link_method": "Link method",
+    "link_methods": {
+      "download": "Download",
+      "stream": "Stream"
+    },
+    "password": "Password",
+    "root_folder_id": "Root folder id",
+    "url": "Url",
+    "user_id": "User id",
+    "username": "Username"
   },
   "FTP": {
     "address": "Address",
@@ -1496,6 +1512,7 @@
     },
     "DoubaoShare": {},
     "Dropbox": {},
+    "Emby": {},
     "FTP": {},
     "FebBox": {},
     "FeijiPan": {},
@@ -1588,6 +1605,7 @@
     "DoubaoNew": "DoubaoNew",
     "DoubaoShare": "DoubaoShare",
     "Dropbox": "Dropbox",
+    "Emby": "Emby",
     "FTP": "FTP",
     "FebBox": "FebBox",
     "FeijiPan": "FeijiPan",
